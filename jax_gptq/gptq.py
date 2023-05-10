@@ -1,7 +1,6 @@
 from collections import namedtuple
 from functools import partial, wraps
 
-import haiku as hk
 import jax
 import jax.numpy as jnp
 from tqdm import tqdm
@@ -239,30 +238,3 @@ pack_colwise = jax.vmap(_pack, 1, out_axes=1)
 
 unpack_rowwise = jax.vmap(_unpack)
 unpack_colwise = jax.vmap(_unpack, 1, out_axes=1)
-
-def main():
-    #dims = [5120, 4096, 768]
-    dims = [5120] * 40
-
-    def fn(x):
-        for dim in tqdm(dims, desc='Layers'):
-            x = hk.Linear(dim)(x)
-            x.block_until_ready()
-            #x = hk.Conv1D(dim, 1)(x[None])[0]
-        return x
-
-    in_dim = 5120
-
-    model = hk.without_apply_rng(hk.transform(fn))
-    params = model.init(jax.random.PRNGKey(0), jnp.zeros(in_dim))
-    cpu_params = jax.tree_map(lambda x: jax.device_put(x, jax.devices('cpu')[0]), params)
-    del params
-
-    gptq = GPTQ()
-
-    inp = jax.device_put(jax.random.normal(jax.random.PRNGKey(0), (128 * 2048, in_dim)), jax.devices('gpu')[0])
-    with gptq.apply_gptq():
-        res = jax.vmap(model.apply, (None, 0))(cpu_params, inp)
-
-if __name__ == '__main__':
-    main()
