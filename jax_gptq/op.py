@@ -9,10 +9,9 @@ from .kernel import matmul_4bit_quantized, matmul_4bit_quantized_traponse_b
 from .gptq import unpack_matrix
 
 def quantized_matmul(x, quantized_matrix, transpose_b=False):
-    unpacked = unpack_matrix(quantized_matrix)
-    return x @ (unpacked.T if transpose_b else unpacked)
-
-    #return _quantized_matmul(x, quantized_matrix, transpose_b)
+    #unpacked = unpack_matrix(quantized_matrix)
+    #return x @ (unpacked.T if transpose_b else unpacked)
+    return _quantized_matmul(x, quantized_matrix, transpose_b)
 
 @partial(jax.custom_vjp, nondiff_argnums=(2,))
 def _quantized_matmul(x, quantized_matrix, transpose_b):
@@ -67,9 +66,9 @@ def _quantized_matmul(x, quantized_matrix, transpose_b):
     return result
 
 def qmatmul_fwd(x, quantized_matrix, transpose_b):
-    assert not transpose_b
-    return x @ unpack_matrix(quantized_matrix), quantized_matrix
-    #return _quantized_matmul(x, quantized_matrix, transpose_b), quantized_matrix
+    #assert not transpose_b
+    #return x @ unpack_matrix(quantized_matrix), quantized_matrix
+    return _quantized_matmul(x, quantized_matrix, transpose_b), quantized_matrix
 
 def qmatmul_bwd(transposed, quantized_matrix, y_bar):
     unpacked = unpack_matrix(quantized_matrix)

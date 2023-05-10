@@ -1,26 +1,28 @@
 from collections import namedtuple
-from contextlib import contextmanager
-from functools import partial
+from functools import partial, wraps
 
 import haiku as hk
 import jax
 import jax.numpy as jnp
-from jax._src.interpreters.batching import BatchTracer
 from tqdm import tqdm
 
-QuantizedMatrix = namedtuple('QuantizedMatrix', ['int_weight', 'zero', 'scale'])
+QuantizedMatrix = namedtuple('QuantizedMatrix', ['int_weight', 'zero', 'scale', 'contraction_axis'])
 
 jax.tree_util.register_pytree_node(
     QuantizedMatrix,
-    lambda x: ((x.int_weight, x.zero, x.scale), None),
-    lambda _, xs: QuantizedMatrix(*xs)
+    lambda x: ((x.int_weight, x.zero, x.scale), x.contraction_axis),
+    lambda contraction_axis, xs: QuantizedMatrix(*xs, contraction_axis)
 )
 
 def quant_matrix_shape(quantized_matrix, bits=4):
-    ele_width = quantized_matrix.int_weight.dtype.itemsize * 8
-    rows = quantized_matrix.int_weight.shape[0] * (ele_width // bits)
-    cols = quantized_matrix.int_weight.shape[1]
-    return (rows, cols)
+    mat = quantized_matrix.int_weight
+    ele_width = mat.dtype.itemsize * 8
+
+    contraction_dim = quantized_matrix.contraction_axis
+    shape = list(mat.shape)
+    shape[contraction_dim] *= ele_width // bits
+
+    return tuple(shape)
 
 def _cholesky_inv(mat):
     cho, upper = jax.scipy.linalg.cho_factor(mat)
@@ -158,20 +160,28 @@ def gptq(W, xs, block_size=128, actorder=False, damping=0.01):
 
     return Q, quantize_params
 
-def pack_matrix(Q, params):
+def pack_matrix(Q, params, contraction_axis=0):
     scale = params['scale']
     zero = params['zero']
-    int_matrix = jnp.round(Q / scale + zero).astype(jnp.uint8)
-    packed = pack_colwise(int_matrix)
+
+    expanded_scale = jnp.expand_dims(scale, axis=contraction_axis)
+    expanded_zero = jnp.expand_dims(zero, axis=contraction_axis)
+
+    int_matrix = jnp.round(Q / expanded_scale + expanded_zero).astype(jnp.uint8)
+    packed = pack_along_axis(contraction_axis, int_matrix,)
     return QuantizedMatrix(
         int_weight=packed,
         zero=zero,
         scale=scale,
+        contraction_axis=contraction_axis
     )
 
 def unpack_matrix(weight):
-    unpacked = unpack_colwise(weight.int_weight)
-    return (unpacked - weight.zero) * weight.scale
+    expanded_zero = jnp.expand_dims(weight.zero, axis=weight.contraction_axis)
+    expanded_scale = jnp.expand_dims(weight.scale, axis=weight.contraction_axis)
+
+    unpacked = unpack_along_axis(weight.contraction_axis, weight.int_weight)
+    return (unpacked - expanded_zero) * expanded_scale
 
 def _pack(w_int):
     assert len(w_int.shape) == 1
@@ -201,6 +211,28 @@ def _unpack(packed):
         )
     return result
 
+def vmap_all_but_one(f, axis):
+    @wraps(f)
+    def inner(arg):
+        n_dim = len(arg.shape)
+        if axis >= n_dim:
+            raise ValueError(f'Axis {axis} is out of bounds for array of dimension {n_dim}')
+
+        fn = f
+        vmap_dim = 1
+        for i in reversed(range(n_dim)):
+            if i == axis:
+                vmap_dim = 0
+            else:
+                fn = jax.vmap(fn, vmap_dim, vmap_dim)
+        return fn(arg)
+    return inner
+
+def pack_along_axis(axis, w):
+    return vmap_all_but_one(_pack, axis)(w)
+
+def unpack_along_axis(axis, w):
+    return vmap_all_but_one(_unpack, axis)(w)
 
 pack_rowwise = jax.vmap(_pack)
 pack_colwise = jax.vmap(_pack, 1, out_axes=1)

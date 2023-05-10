@@ -31,7 +31,7 @@ def partial_static_args(f, static_argnums, *args):
         return f(*args, **kwargs)
     return inner
 
-def use_quantized(f, static_argnums=()):
+def use_quantized(f, static_argnums=(), use_kernel=False):
     if isinstance(static_argnums, int):
         static_argnums = (static_argnums,)
     @wraps(f)
@@ -50,13 +50,14 @@ def use_quantized(f, static_argnums=()):
         result = eval_jaxpr_with_quantized_args(
             closed_jaxpr.jaxpr,
             closed_jaxpr.literals,
-            *flat_args
+            *flat_args,
+            use_kernel=use_kernel
         )
         return jax.tree_util.tree_unflatten(output_struct, result)
 
     return inner
 
-def eval_jaxpr_with_quantized_args(jaxpr, consts, *args):
+def eval_jaxpr_with_quantized_args(jaxpr, consts, *args, use_kernel=False):
     def read(v):
       return v.val if isinstance(v, Literal) else env[v]
 
@@ -70,7 +71,7 @@ def eval_jaxpr_with_quantized_args(jaxpr, consts, *args):
         args = [*safe_map(read, eqn.invars)]
         ans = None
         if any(isinstance(arg, QuantizedMatrix) for arg in args):
-            ans = eval_with_quantized(eqn, args)
+            ans = eval_with_quantized(eqn, args, use_kernel=use_kernel)
             if ans is None:
                 args = [unpack_matrix(arg) if isinstance(arg, QuantizedMatrix) else arg for arg in args]
 
@@ -84,21 +85,25 @@ def eval_jaxpr_with_quantized_args(jaxpr, consts, *args):
             write(eqn.outvars[0], ans)
     return safe_map(read, jaxpr.outvars)
 
-def eval_with_quantized(eqn, args):
+def eval_with_quantized(eqn, args, use_kernel=False):
     if eqn.primitive.name == 'pjit':
         jaxpr = eqn.params['jaxpr']
         literals = jaxpr.literals
-        new_fn = partial(eval_jaxpr_with_quantized_args, jaxpr.jaxpr)
+        new_fn = partial(eval_jaxpr_with_quantized_args, jaxpr.jaxpr, use_kernel=use_kernel)
         return jax.experimental.pjit.pjit(new_fn)(literals, *args)
 
     if eqn.primitive.name == 'remat2':
         jaxpr = eqn.params['jaxpr']
-        new_fn = partial(eval_jaxpr_with_quantized_args, jaxpr)
+        new_fn = partial(eval_jaxpr_with_quantized_args, jaxpr, use_kernel=use_kernel)
         return jax.checkpoint(
             new_fn,
             prevent_cse=eqn.params['prevent_cse'],
             policy=eqn.params['policy']
         )([], *args)
+
+    if not use_kernel:
+        warnings.warn('Not using matmul kernel')
+        return None
 
     if eqn.primitive.name != 'dot_general':
        warnings.warn('Only dot_general is supported for now, so quantized matrix will be unpacked')
@@ -123,5 +128,4 @@ def eval_with_quantized(eqn, args):
         warnings.warn('Triton kernel only available on GPU, running full unpack followed by matmul')
         return None
     """
-
     return quantized_matmul(lhs, rhs)

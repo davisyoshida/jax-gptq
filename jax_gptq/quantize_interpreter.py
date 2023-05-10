@@ -1,13 +1,16 @@
 from collections import defaultdict
 from copy import deepcopy
-from functools import partial
+from functools import partial, reduce
+import numpy as np
+import warnings
 
 import jax
+import jax.numpy as jnp
 from jax._src.core import Literal
 from jax.util import safe_map
 from tqdm import tqdm
 
-from .gptq import gptq, pack_matrix
+from .gptq import gptq, pack_matrix, QuantizedMatrix
 
 def tree_size_bytes(tree):
     return jax.tree_util.tree_reduce(
@@ -19,9 +22,9 @@ def tree_size_bytes(tree):
         0
     )
 
-#jit_gptq = jax.jit(gptq, static_argnames=('block_size',))
 def quantize(fn, params, inputs, block_size=128, actorder=False, damping=0.01):
-    closed_jaxpr = jax.make_jaxpr(fn)(params, inputs[0])
+    with jax.disable_jit():
+        closed_jaxpr = jax.make_jaxpr(fn)(params, inputs[0])
     params = jax.device_put(params, jax.devices('cpu')[0])
     inputs = jax.device_put(inputs, jax.devices('cpu')[0])
 
@@ -43,7 +46,7 @@ def quantize(fn, params, inputs, block_size=128, actorder=False, damping=0.01):
         damping=damping
     )
     for ind, quantized_param in result.items():
-        param_args[ind] = pack_matrix(*quantized_param)
+        param_args[ind] = quantized_param
 
     return jax.tree_util.tree_unflatten(param_struct, param_args)
 
@@ -74,12 +77,16 @@ def _eval_and_quantize(jaxpr, consts, argnums, *args, block_size=128, actorder=F
     name_to_pos = {}
 
     n_batches = len(next(a for i, a in enumerate(args) if i not in argnums))
-    envs = [{} for _ in range(n_batches)] # Everything in here should be on GPU
-    param_env = {} # Only some things in here should be on GPU
+
+     # Everything in here should be on GPU
+    envs = [{} for _ in range(n_batches)]
+
+    # Map from var name to a tuple of value, original_name, and a stack of transformations to map it back to orig param shape
+    param_env = {}
 
     for index, name in enumerate(jaxpr.invars):
         if index in argnums:
-            param_env[name] = args[index]
+            param_env[name] = (args[index], name, ())
             name_to_pos[name] = index
         else:
             for i in range(n_batches):
@@ -94,28 +101,37 @@ def _eval_and_quantize(jaxpr, consts, argnums, *args, block_size=128, actorder=F
 
     delete_points = _get_delete_points(jaxpr)
 
-    env = defaultdict(list)
     const_env = {name: val for name, val in zip(jaxpr.constvars, consts)}
     pos = 0
-    bar = tqdm()
+    bar = tqdm(desc='Quantizing')
     while True:
         bar.update(1)
-        seek_vars = {name for name, val in param_env.items() if len(val.shape) == 2}
-        next_pos, needed_names = find_next_matmul(jaxpr, pos, seek_vars)
+        next_pos, needed_names, matmul_handler, updated_param_env = update_params_to_next_matmul(
+            eqns=jaxpr.eqns,
+            start_pos=pos,
+            delete_points=delete_points,
+            param_env=param_env,
+            env=envs[0]
+        )
         if next_pos is None:
             break
 
         block_param_env = {
-            name: jax.device_put(param_env[name], gpu)
+            name: jax.device_put(param_env[name][0], gpu)
             for name in needed_names if name in param_env
         }
 
-        #print(f'Current env size: {tree_size_bytes(envs):.2e} bytes')
-        #print(f'Current param env size: {tree_size_bytes(block_param_env):.2e} bytes')
-
+        print(f'Current env size: {tree_size_bytes(envs):.2e} bytes')
+        print(f'Current param env size: {tree_size_bytes(block_param_env):.2e} bytes')
         delete_keys = set(var for i in range(pos, next_pos) for var in delete_points[i])
 
-        block_fn = jax.jit(partial(run_segment, jaxpr, pos, next_pos, delete_points))
+        segment_eqns = jaxpr.eqns[pos:next_pos]
+
+        # If a parameter has been transformed keep it in the param env instead of the individual envs
+        drop_env_keys = set(k for k in updated_param_env if k not in param_env)
+        missing_keys = set(k for k in param_env if k not in updated_param_env)
+
+        block_fn = jax.jit(partial(run_segment, segment_eqns, pos, delete_points, drop_env_keys))
         for i, env in enumerate(envs):
             gpu_env = jax.device_put(env, gpu)
             new_env = block_fn(block_param_env, gpu_env, const_env)
@@ -129,60 +145,142 @@ def _eval_and_quantize(jaxpr, consts, argnums, *args, block_size=128, actorder=F
             param.device_buffer.delete()
         del block_param_env
 
+        param_env = updated_param_env
+
         #(jax.device_put(0., gpu) + 0).block_until_ready()
 
         matmul_eqn = jaxpr.eqns[next_pos]
-        lhs_name, w_name = matmul_eqn.invars
 
-        xs = []
-        for env in envs:
-            lhs_val = jax.device_put(env[lhs_name], gpu)
-            xs.append(lhs_val)
+        all_args = []
+        if sum(argname in param_env for argname in matmul_eqn.invars) > 1:
+            raise NotImplementedError('Currently only one quantize target is supported per op')
 
+        quantize_argname = next(argname for argname in matmul_eqn.invars if argname in param_env)
 
-        w = jax.device_put(param_env[w_name], gpu)
+        for argname in matmul_eqn.invars:
+            if argname in param_env:
+                all_args.append(param_env[argname][0])
+            else:
+                all_args.append([env[argname] for env in envs])
+        all_args = [jax.device_put(arg, gpu) for arg in all_args]
+
+        handler_coro = matmul_handler(all_args)
+
+        w, xs = next(handler_coro)
+
         quantized_w, quantize_params = gptq(w, xs, block_size=block_size, actorder=actorder, damping=damping)
-
         assert quantized_w.shape == w.shape
-        outvar, = jaxpr.eqns[next_pos].outvars
-        matmul_eval = jax.jit(partial(eval_eqn, matmul_eqn))
-        #matmul_eval = partial(eval_eqn, matmul_eqn)
+
+        try:
+            handler_coro.send((quantized_w, quantize_params['scale'], quantize_params['zero']))
+            assert False, 'Handler should have stopped'
+        except StopIteration as e:
+            quantized_w, quantize_params['scale'], quantize_params['zero'], contraction_axis = e.value
+
+        outvars = jaxpr.eqns[next_pos].outvars
+
+        delete_indices = [i for i, name in enumerate(matmul_eqn.invars) if name != quantize_argname]
+
+        do_eval = jax.jit(partial(eval_eqn, matmul_eqn))
         for env in envs:
-            #env[outvar] = eval_eqn(matmul_eqn, env[lhs_name], quantized_w)
-            gpu_lhs = jax.device_put(env[lhs_name], gpu)
-            env[outvar] = matmul_eval(gpu_lhs, quantized_w)
-            gpu_lhs.device_buffer.delete()
+            gpu_args = [
+                quantized_w
+                if argname == quantize_argname else
+                jax.device_put(env[argname], gpu) 
+                for argname in matmul_eqn.invars
+            ]
+            results = do_eval(*gpu_args)
+
+            if tree_size_bytes(results) > 1e8:
+                # This should offload stuff like the final logits to the CPU
+                cpu_results = jax.device_put(results, cpu)
+                jax.tree_map(lambda x: x.is_deleted() or x.device_buffer.delete(), results)
+                results = cpu_results
+
+            if matmul_eqn.primitive.multiple_results:
+                for outvar, value in zip(outvars, results):
+                    env[outvar] = value
+            else:
+                env[outvars[0]] = results
+
+            for i in delete_indices:
+                gpu_args[i].device_buffer.delete()
             #(jax.device_put(0., gpu) + 0).block_until_ready()
 
         for name in delete_points[next_pos]:
             delete(name)
 
-        param_env[w_name].device_buffer.delete()
+        # TODO: Instead of catching duplicate quantizations here avoid doing the calculation in the first place
+        orig_w, orig_name, inv_transforms = param_env[quantize_argname]
+        write_arg = name_to_pos[orig_name]
+        if write_arg not in quantized_results:
+            packed_result = pack_matrix(quantized_w, quantize_params, contraction_axis)
+            un_transformed = reduce(lambda x, f: f(x), inv_transforms, packed_result)
+            quantized_results[write_arg] = un_transformed
 
-        cpu_quantized_w = jax.device_put(quantized_w, cpu)
+            if quantize_argname not in delete_points[next_pos]:
+                cpu_quantized_w = jax.device_put(quantized_w, cpu)
+                param_env[quantize_argname] = cpu_quantized_w, orig_name, inv_transforms
+            orig_w.device_buffer.delete()
+        elif quantize_argname in delete_points[next_pos]:
+            orig_w.device_buffer.delete()
+            del param_env[quantize_argname]
+
         quantized_w.device_buffer.delete()
-
-        param_env[w_name] = cpu_quantized_w
-        quantized_results[name_to_pos[w_name]] = cpu_quantized_w, jax.device_put(quantize_params, cpu)
-
         #(jax.device_put(0., gpu) + 0).block_until_ready()
-
         pos = next_pos + 1
+
     return quantized_results
 
-def find_next_matmul(jaxpr, start_point, target_vars):
-    needed_names = set()
-    for i, eqn in enumerate(jaxpr.eqns[start_point:], start_point):
-        invars = eqn.invars
-        if eqn.primitive.name == 'dot_general':
-            rhs = invars[1]
-            (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = eqn.params['dimension_numbers']
-            if rhs in target_vars and rhs_contract == (0,): # TODO: Might want to check lhs_contract too
-                return i, needed_names
-        needed_names.update(v for v in invars if not isinstance(v, Literal))
-    return None, needed_names
+def update_params_to_next_matmul(eqns, start_pos, delete_points, param_env, env):
+    new_param_env = {k: v for k, v in param_env.items()}
+    env_shapes = {k: jax.ShapeDtypeStruct(v.shape, v.dtype) for k, v in env.items()}
 
-def run_segment(jaxpr, start_pos, next_pos, delete_points, param_env, env, const_env):
+    needed_names = set()
+    for i, eqn in enumerate(eqns[start_pos:], start_pos):
+        invars = eqn.invars
+        op_name = eqn.primitive.name
+        if op_name in PARAM_TRANSFORMS:
+            arg, = invars
+            needed_names.add(arg)
+            if arg in new_param_env and len(new_param_env[arg][0].shape) > 1:
+                val, orig_name, transforms = new_param_env[arg]
+                new_transform = PARAM_TRANSFORMS[op_name](eqn, val)
+                new_name, = eqn.outvars
+                new_val = eval_eqn(eqn, val)
+                new_param_env[new_name] = new_val, orig_name, (transforms + (new_transform,))
+                if arg in delete_points[i]: #TODO: Become certain that making this just a soft check was fine
+                    del new_param_env[arg]
+                else:
+                    warnings.warn(f'Transformation `{op_name}` is applied to a target parameter of shape {new_param_env[arg][0].shape} which is later reused. This may lead to this parameter not being quantized, or it being quantized poorly.')
+                continue
+
+        arg_shapes = [invar.aval for invar in invars]
+
+        args_are_targets = [(
+            False if isinstance(v, Literal) else
+            (v in new_param_env and len(new_param_env[v][0].shape) > 1)
+        ) for v in invars]
+
+        if any(args_are_targets):
+            if op_name == 'pjit':
+                warnings.warn(f'Quantization does not descend into pjit')
+            if op_name in PRIMITIVE_TO_MATMUL:
+                predicate, handler = PRIMITIVE_TO_MATMUL[op_name]
+                if predicate(eqn, args_are_targets, arg_shapes):
+                    return i, needed_names, partial(handler, eqn, args_are_targets), new_param_env
+            else:
+                warnings.warn(f'Operation {eqn.primitive.name} not supported for quantization')
+
+
+        out_shapes = jax.eval_shape(partial(eval_eqn, eqn), *arg_shapes)
+        if not eqn.primitive.multiple_results:
+            out_shapes = [out_shapes]
+        safe_map(env_shapes.__setitem__, eqn.outvars, out_shapes)
+        needed_names.update(v for v in invars if not isinstance(v, Literal))
+    return None, needed_names, None, None
+
+def run_segment(eqns, start_pos, delete_points, drop_env_keys, param_env, env, const_env):
     env = dict(env)
     def read(v):
         if isinstance(v, Literal):
@@ -193,11 +291,10 @@ def run_segment(jaxpr, start_pos, next_pos, delete_points, param_env, env, const
             return env[v]
         return const_env[v]
 
-
     def write(v, val):
         env[v] = val
 
-    for i, eqn in enumerate(jaxpr.eqns[start_pos:next_pos], start_pos):
+    for i, eqn in enumerate(eqns, start_pos):
         eqn_args = safe_map(read, eqn.invars)
         ans = eval_eqn(eqn, *eqn_args)
         if eqn.primitive.multiple_results:
@@ -208,20 +305,190 @@ def run_segment(jaxpr, start_pos, next_pos, delete_points, param_env, env, const
         for varname in delete_points[i]:
             if varname in env:
                 del env[varname]
+    for key in drop_env_keys:
+        env.pop(key, None)
     return env
+
+def dot_general_predicate(eqn, args_are_targets, args):
+    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = eqn.params['dimension_numbers']
+    if sum(args_are_targets) > 1:
+        warnings.warn('Quantizing two parameters which are multiplied together is not supported')
+        return False
+    if lhs_batch or rhs_batch:
+        warnings.warn('Quantizing batched matmuls is not supported')
+        return False
+    if len(lhs_contract) > 1 or len(rhs_contract) > 1:
+        warnings.warn('Quantizing dots with more than one contraction is not supported')
+        return False
+
+    return True
+
+
+@partial(jax.jit, static_argnums=(1, 2))
+def permute_to_matrix(w, permutation, keep_first):
+    w = jnp.transpose(w, permutation)
+
+    out_shape = (w.shape[0], -1) if keep_first else (-1, w.shape[-1])
+    w = jnp.reshape(w, out_shape)
+    return w
+
+@partial(jax.jit, static_argnums=(1, 2))
+def to_original_shape(w, shape, restore_permutation):
+    return jnp.transpose(
+        jnp.reshape(w, shape),
+        restore_permutation
+    )
+
+def handle_dot_general(eqn, args_are_targets, args):
+    lhs, rhs = args
+    ((lhs_contract,), (rhs_contract,)), _ = eqn.params['dimension_numbers']
+    if args_are_targets[0]:
+        w, xs = lhs, rhs
+        w_contract, x_contract = lhs_contract, rhs_contract
+    else:
+        w, xs = rhs, lhs
+        w_contract, x_contract = rhs_contract, lhs_contract
+
+    orig_w_shape = w.shape
+    w_permutation = None
+    if w_contract != 0 or len(w.shape) > 2:
+        w_permutation = tuple([w_contract, *(i for i in range(len(w.shape)) if i != w_contract)])
+        w = permute_to_matrix(w, w_permutation, True)
+
+    assert isinstance(xs, list)
+
+    x_permutation = None
+    if x_contract != len(xs[0].shape) - 1:
+        x_permutation = tuple([*(i for i in range(len(xs[0].shape)) if i != x_contract), x_contract])
+
+    prepared_xs = []
+    for x in xs:
+        if x_permutation is not None:
+            x = permute_to_matrix(x, x_permutation, False)
+        prepared_xs.append(x)
+
+    quantized_w, scales, zeros = yield w, prepared_xs
+
+    if w_permutation:
+        unpermute = tuple(np.argsort(w_permutation))
+        shape = tuple(orig_w_shape[i] for i in w_permutation)
+        quantized_w = to_original_shape(quantized_w, shape, unpermute)
+
+        scale_shape = tuple(d for i, d in enumerate(orig_w_shape) if i != w_contract)
+        scales = jnp.reshape(scales, scale_shape)
+        zeros = jnp.reshape(zeros, scale_shape)
+
+    return quantized_w, scales, zeros, int(w_contract)
+
+def conv_predicate(eqn, args_are_targets, args):
+    inp_is_target, kernel_is_target = args_are_targets
+    if inp_is_target:
+        warnings.warn('Only quantizing the kernel of a conv is supported, not the input')
+
+    if not kernel_is_target:
+        return False
+
+    params = eqn.params
+    if any(val != 1 for val in params['window_strides']):
+        warnings.warn('Currently only quantizing convs with stride 1 is supported')
+        return False
+
+    if any(val != 1 for val in params['rhs_dilation']):
+        warnings.warn('Currently only quantizing convs with dilation 1 is supported')
+        return False
+
+    if params['feature_group_count'] != 1:
+        warnings.warn('Currently only quantizing convs with feature group count 1 is supported')
+        return False
+
+    if params['batch_group_count'] != 1:
+        warnings.warn('Currently only quantizing convs with batch group count 1 is supported')
+        return False
+
+    # Each is: Batch, feature, spatial...
+    kernel_spatial_dims = params['dimension_numbers'][1][2:]
+
+    kernel_shape = args[1].shape
+    for spatial_dim in kernel_spatial_dims:
+        if kernel_shape[spatial_dim] != 1:
+            warnings.warn('Currently only quantizing convs with 1x..x1 kernels are supported')
+            return False
+
+    return True
+
+def handle_conv(eqn, args_are_targets, args):
+    inps, kernel = args
+    inp_shape = inps[0].shape
+    kernel_shape = kernel.shape
+
+    (inp_batch_dim, inp_feature_dim, inp_spatial_dims), (kernel_out_dim, kernel_in_dim, *kernel_spatial_dims), _ = eqn.params['dimension_numbers']
+
+    flat_kernel = jnp.squeeze(kernel, kernel_spatial_dims)
+
+    needs_transpose = kernel_out_dim < kernel_in_dim
+    if needs_transpose:
+        flat_kernel = flat_kernel.T
+
+    inp_permutation = None
+    if inp_feature_dim != len(inp_shape) - 1:
+        inp_permutation = tuple([*(i for i in range(len(inp_shape)) if i != inp_feature_dim), inp_feature_dim])
+
+    prepared_inps = []
+    for inp in inps:
+        if inp_permutation is not None:
+            inp = permute_to_matrix(inp, inp_permutation, False)
+        prepared_inps.append(inp)
+
+    quantized_kernel, scales, zeros = yield flat_kernel, prepared_inps
+
+    if needs_transpose:
+        quantized_kernel = quantized_kernel.T
+
+    for dim in sorted(kernel_spatial_dims):
+        quantized_kernel = jnp.expand_dims(quantized_kernel, dim)
+        scale_dim = dim if dim < inp_feature_dim else dim - 1
+        scales = jnp.expand_dims(scales, scale_dim)
+        zeros = jnp.expand_dims(zeros, scale_dim)
+
+    return quantized_kernel, scales, zeros, kernel_in_dim
 
 def eval_eqn(eqn, *args):
     subfuns, bind_params = eqn.primitive.get_bind_params(eqn.params)
     ans = eqn.primitive.bind(*subfuns, *args, **bind_params)
     return ans
 
-# State:
-# What point am I at? Either start or a matmul
-# Env for evaluating that segment
+PRIMITIVE_TO_MATMUL = {
+    'dot_general': (dot_general_predicate, handle_dot_general),
+    'conv_general_dilated': (conv_predicate, handle_conv)
+}
 
-# Info needed:
-#   - What can I free
-#   - How many batches are there
+def inverse_transpose(eqn, arg):
+    unpermute = tuple(np.argsort(eqn.params['permutation']))
+    def inverse(quantized_matrix):
+        prev_contract_axis = quantized_matrix.contraction_axis
+        new_contraction_axis = unpermute[prev_contract_axis]
+        new_int_weight = jax.lax.transpose(quantized_matrix.int_weight, permutation=unpermute)
 
-# Other:
-# Move args for segment to GPU
+        unpermute_scale = [
+            i if i < prev_contract_axis else i - 1
+            for i in unpermute
+            if i != prev_contract_axis
+        ]
+        new_scale = jax.lax.transpose(quantized_matrix.scale, permutation=unpermute_scale)
+        new_zero = jax.lax.transpose(quantized_matrix.zero, permutation=unpermute_scale)
+        return QuantizedMatrix(
+            int_weight=new_int_weight,
+            scale=new_scale,
+            zero=new_zero,
+            contraction_axis=new_contraction_axis
+        )
+
+    return inverse
+
+def inverse_convert_type(eqn, arg):
+    return lambda x: x
+
+PARAM_TRANSFORMS = {
+    'transpose': inverse_transpose,
+    'convert_element_type': inverse_convert_type,
+}

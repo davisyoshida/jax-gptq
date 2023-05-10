@@ -5,7 +5,7 @@ from .gptq import QuantizedMatrix, quant_matrix_shape
 
 def _shape_from_param(x):
     if isinstance(x, QuantizedMatrix):
-        return jax.ShapedArray(quant_matrix_shape(x), jnp.float16)
+        return jax.ShapedArray(quant_matrix_shape(x), jnp.float32, weak_type=True)
     if isinstance(x, jax.core.Trace):
         return jax.core.get_aval(x)
     return x
