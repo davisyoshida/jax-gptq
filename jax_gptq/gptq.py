@@ -3,9 +3,22 @@ from functools import partial, wraps
 
 import jax
 import jax.numpy as jnp
-from tqdm import tqdm
 
-QuantizedMatrix = namedtuple('QuantizedMatrix', ['int_weight', 'zero', 'scale', 'contraction_axis'])
+class QuantizedMatrix:
+    def __init__(self, int_weight, zero, scale, contraction_axis=0):
+        self.int_weight = int_weight
+        self.zero = zero
+        self.scale = scale
+        self.contraction_axis = contraction_axis
+
+    @property
+    def shape(self):
+        result = quant_matrix_shape(self)
+        return result
+
+    @property
+    def dtype(self):
+        return self.zero.dtype
 
 jax.tree_util.register_pytree_node(
     QuantizedMatrix,
