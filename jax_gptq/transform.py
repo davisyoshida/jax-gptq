@@ -102,7 +102,7 @@ def eval_with_quantized(eqn, args, use_kernel=False):
         )([], *args)
 
     if not use_kernel:
-        warnings.warn('Not using matmul kernel')
+        #warnings.warn('Not using matmul kernel')
         return None
 
     if eqn.primitive.name != 'dot_general':
