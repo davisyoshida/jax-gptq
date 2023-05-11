@@ -5,13 +5,16 @@ import jax.numpy as jnp
 import jax_triton as jt
 import triton
 
-from .kernel import matmul_4bit_quantized, matmul_4bit_quantized_traponse_b
+from .kernel import matmul_4bit_quantized, matmul_4bit_quantized_transpose_b
 from .gptq import unpack_matrix
 
 def quantized_matmul(x, quantized_matrix, transpose_b=False):
     #unpacked = unpack_matrix(quantized_matrix)
     #return x @ (unpacked.T if transpose_b else unpacked)
     return _quantized_matmul(x, quantized_matrix, transpose_b)
+
+def grid_fn(META):
+    return triton.cdiv(META['M'], META['BLOCK_SIZE_M']) * triton.cdiv(META['N'], META['BLOCK_SIZE_N']),
 
 @partial(jax.custom_vjp, nondiff_argnums=(2,))
 def _quantized_matmul(x, quantized_matrix, transpose_b):
@@ -38,7 +41,7 @@ def _quantized_matmul(x, quantized_matrix, transpose_b):
     assert K == K2, f'Inner dim mismatch: {K} != {K2}'
 
     out_struct = jax.ShapeDtypeStruct((M, out_N), jnp.float16)
-    kernel = matmul_4bit_quantized_traponse_b if transpose_b else matmul_4bit_quantized
+    kernel = matmul_4bit_quantized_transpose_b if transpose_b else matmul_4bit_quantized
 
     result = jt.triton_call(
         x,
@@ -47,7 +50,7 @@ def _quantized_matmul(x, quantized_matrix, transpose_b):
         scale,
         out_shape=out_struct,
         kernel=kernel,
-        grid=lambda META: (triton.cdiv(META['M'], META['BLOCK_SIZE_M']) * triton.cdiv(META['N'], META['BLOCK_SIZE_N']),),
+        grid=grid_fn,
         stride_am=K,
         stride_ak=1,
         stride_bn=stride_bn,

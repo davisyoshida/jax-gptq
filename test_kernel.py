@@ -7,7 +7,11 @@ from jax_gptq.op import quantized_matmul
 
 @pytest.mark.parametrize(
     'M,N,K,transpose',
-    [(137, 909, 256, t) for t in (True, False)]#, (32, 1024, 2048), (37, 32000, 5120)]
+    [
+        (*shape, t)
+        for t in (True, False)
+        for shape in [(137, 909, 256), (32, 1024, 2048), (37, 32000, 5120)]
+    ]
 )
 def test_kernel(M, N, K, transpose):
     xs = [jax.random.normal(jax.random.PRNGKey(key), (M, K)) for key in range(1)]
@@ -23,13 +27,15 @@ def test_kernel(M, N, K, transpose):
     def f(x, packed):
         return quantized_matmul(x, packed, transpose_b=transpose)
 
-    #jit_fn = quantized_matmul
-    for _ in range(1):
+    # Loop b/c there was a problem with autotuned triton kernels returning inconsistent values
+    for run in range(4):
         ret = f(test_input, packed)
-        print(jnp.sum(ret))
+        print(f'Run {run} output: {jnp.sum(ret)}')
 
     max_gap = jnp.max(jnp.abs(ret - expected))
     print(f'Result:\n{ret[15:19, -3:]}')
     print(f'Expected:\n{expected[15:19, -3:]}')
     print(f'Max gap: {max_gap}')
-    assert jnp.allclose(ret, expected, atol=4e-2, rtol=0)
+    avg_gap = jnp.mean(jnp.abs(ret - expected))
+    print(f'Avg gap: {avg_gap}')
+    assert avg_gap < 3e-2

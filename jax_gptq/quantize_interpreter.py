@@ -22,7 +22,7 @@ def tree_size_bytes(tree):
         0
     )
 
-def quantize(fn, params, inputs, block_size=128, actorder=False, damping=0.01):
+def quantize(fn, params, inputs, block_size=128, actorder=False, damping=0.01, use_quantized_activations=True):
     with jax.disable_jit():
         closed_jaxpr = jax.make_jaxpr(fn)(params, inputs[0])
     params = jax.device_put(params, jax.devices('cpu')[0])
@@ -43,7 +43,8 @@ def quantize(fn, params, inputs, block_size=128, actorder=False, damping=0.01):
         *input_args,
         block_size=block_size,
         actorder=actorder,
-        damping=damping
+        damping=damping,
+        use_quantized_activations=use_quantized_activations
     )
     for ind, quantized_param in result.items():
         param_args[ind] = quantized_param
@@ -68,7 +69,7 @@ def _get_delete_points(jaxpr):
         delete_vars.append(eqn_delete)
     return delete_vars
 
-def _eval_and_quantize(jaxpr, consts, argnums, *args, block_size=128, actorder=False, damping=0.01):
+def _eval_and_quantize(jaxpr, consts, argnums, *args, block_size=128, actorder=False, damping=0.01, use_quantized_activations=True):
     cpu = jax.devices('cpu')[0]
     gpu = jax.devices('gpu')[0]
     # Args are all either params or lists of tensors
@@ -182,13 +183,15 @@ def _eval_and_quantize(jaxpr, consts, argnums, *args, block_size=128, actorder=F
         delete_indices = [i for i, name in enumerate(matmul_eqn.invars) if name != quantize_argname]
 
         do_eval = jax.jit(partial(eval_eqn, matmul_eqn))
+        
         for env in envs:
             gpu_args = [
-                quantized_w
+                (quantized_w if use_quantized_activations else param_env[argname][0])
                 if argname == quantize_argname else
-                jax.device_put(env[argname], gpu) 
+                env[argname]
                 for argname in matmul_eqn.invars
             ]
+            gpu_args = jax.device_put(gpu_args, gpu)
             results = do_eval(*gpu_args)
 
             if tree_size_bytes(results) > 1e8:
