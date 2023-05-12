@@ -1,4 +1,5 @@
 from collections import namedtuple
+from contextlib import nullcontext
 from functools import partial, wraps
 
 import jax
@@ -43,30 +44,50 @@ def _cholesky_inv(mat):
     return hinv_cholesky
     #return hinv
 
-@partial(jax.jit, donate_argnums=(0, 1, 2))
-def _accumulate_H_step(H, prev_samples, current_multiplier, batch):
-    batch_size = batch.shape[0]
+@partial(jax.jit, static_argnums=(1,))
+def _calc_mean(xs, dtype):
+    means = [jnp.mean(x.astype(dtype).reshape(-1, x.shape[-1]), axis=0) for x in xs]
+    mean_of_means = jnp.mean(jnp.stack(means), axis=0)
+    return mean_of_means
+
+@partial(jax.jit, donate_argnums=(0,), static_argnums=(3,))
+def _accumulate_H_step(H, feature_mean, batch, N):
     if len(batch.shape) > 2:
         batch = batch.reshape(-1, batch.shape[-1])
-    batch = batch.astype(H.dtype)
-    assert len(batch.shape) == 2
-    new_samples = batch_size + prev_samples
-    H *= prev_samples / new_samples
-    batch *= jnp.sqrt(2 * current_multiplier / new_samples)
-    H += batch.T @ batch
-    #mult_update = jnp.max(jnp.abs(H))
-    #H /= mult_update
-    #new_multiplier = current_multiplier / mult_update
-    new_multiplier = current_multiplier
-    return H, new_samples, new_multiplier
 
-def accumulate_H(xs):
-    samples = jnp.zeros((), dtype=xs[0].dtype)
-    multiplier = jnp.ones((), dtype=jnp.float32)
+    N = jnp.asarray(N, H.dtype)
+
+    batch = batch.astype(H.dtype)
+
+    shifted = (batch - feature_mean) / jnp.sqrt(N)
+
+    H += shifted.T @ shifted
+
+    return H
+
+def accumulate_H(xs, use_fp64=False):
+    """
+    The method here differs from the original GPT-Q implementation.
+    Instead of calculating the mean of XX^T directly, I instead subtract
+    the feature mean off of each batch, then calculate the variance.
+    The second moment can then be recovered by the outer product
+    of the mean vector with itself. I don't bother dividing
+    by the number of examples since the algorithm is invariant
+    to rescalings of H.
+    """
+
+    dtype = jnp.float64 if use_fp64 else jnp.float32
+    feature_mean = _calc_mean(xs, dtype)
+
     dim = xs[0].shape[-1]
-    H = jnp.zeros((dim, dim), dtype=jnp.float32)
+    N = sum(x.shape[0] for x in xs)
+    H = jnp.zeros((dim, dim), dtype=dtype)
+
     for batch in xs:
-        H, samples, multiplier = _accumulate_H_step(H, samples, multiplier, batch)
+        H = _accumulate_H_step(H, feature_mean, batch, N)
+
+    H += jnp.outer(feature_mean, feature_mean)
+
     return H
 
 def get_quantize_params(weight, bits=4):
@@ -130,8 +151,9 @@ def _damp_and_invert(W, H, damping):
     H = H.at[positions, positions].add(mean_diag * damping)
 
     Hinv = _cholesky_inv(H)
+    any_nan = jnp.any(jnp.isnan(Hinv))
     #Hinv = jnp.linalg.inv(H)
-    return W, Hinv
+    return W, Hinv, any_nan
 
 @partial(jax.jit, donate_argnums=(0, 1))
 def _permute(W, H):
@@ -145,17 +167,22 @@ def _unpermute(Q, perm):
     invperm = jnp.argsort(perm)
     return Q[invperm, :]
 
-def gptq(W, xs, block_size=128, actorder=False, damping=0.01):
+def gptq(W, xs, block_size=128, actorder=False, damping=0.01, use_fp64=False):
     orig_type = W.dtype
     W = W.astype(jnp.float32)
     quantize_params = get_col_quantize_params(W)
-    H = accumulate_H(xs)
+    with (jax.experimental.enable_x64() if use_fp64 else nullcontext()):
+        H = accumulate_H(xs, use_fp64=use_fp64)
 
-    perm = None
-    if actorder:
-        W, H, perm = _permute(W, H)
+        perm = None
+        if actorder:
+            W, H, perm = _permute(W, H)
 
-    W, Hinv = _damp_and_invert(W, H, damping)
+        W, Hinv, any_nan = _damp_and_invert(W, H, damping)
+        if any_nan:
+            xs_nan = any(jnp.any(jnp.isnan(x)) for x in xs)
+            raise ValueError('NaN when computing Hinv. Features NaN?: {xs_nan}')
+        Hinv = Hinv.astype(jnp.float32)
 
     blocks = []
     carry = W

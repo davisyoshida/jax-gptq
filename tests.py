@@ -9,7 +9,16 @@ import pytest
 
 from jax_gptq import use_quantized
 from jax_gptq.quantize_interpreter import quantize
-from jax_gptq.gptq import pack_colwise, unpack_colwise, pack_matrix, unpack_matrix, get_col_quantize_params, gptq, QuantizedMatrix
+from jax_gptq.gptq import (
+    pack_colwise,
+    unpack_colwise,
+    pack_matrix,
+    unpack_matrix,
+    get_col_quantize_params,
+    gptq,
+    QuantizedMatrix,
+    accumulate_H
+)
 
 @pytest.fixture
 def simple_model():
@@ -280,3 +289,23 @@ def test_reuse(simple_model):
     assert isinstance(quantized_params, QuantizedMatrix)
 
     quantized_output = use_quantized(f)(quantized_params, xs[0])
+
+def test_accumulate_H():
+    bsize = 37
+    n = 256
+    with jax.experimental.enable_x64():
+        xs = []
+        key = jax.random.PRNGKey(9876)
+        for _ in range(20):
+            xs.append(jax.random.normal(key, (bsize, n), jnp.float64))
+
+        n_ex = sum(x.shape[0] for x in xs)
+
+        manual_calculation = jnp.sum(
+            jnp.stack([x.T @ x for x in xs]),
+            axis=0
+        ) / n_ex
+
+        gptq_result = accumulate_H(xs, use_fp64=True)
+
+    assert np.allclose(manual_calculation, gptq_result, atol=1e-15)

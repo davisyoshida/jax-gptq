@@ -22,9 +22,35 @@ def tree_size_bytes(tree):
         0
     )
 
-def quantize(fn, params, inputs, block_size=128, actorder=False, damping=0.01, use_quantized_activations=True):
+def quantize(
+    fn,
+    params,
+    inputs,
+    block_size=128,
+    actorder=False,
+    damping=0.01,
+    use_quantized_activations=True,
+    use_fp64=False,
+    use_params_fp32=False
+):
+    """
+    Run the GPT-Q algorithm on a function to produce quantized versions of its parameters
+    Arguments:
+        fn: The function to be transformed. It should take two arguments:
+            1. A pytree of parameters to be quantized. This corresponds to the `params` pytree from libraries such as Flax/Haiku
+            2. A pytree of other arguments. If the original model takes more than one extra argument, you can write a wrapper which takes a tuple as the second argument. TODO: handle varargs
+        params: The params pytree. Buffers in this tree may be freed to save memory, so do not re-use it after calling this function.
+        inputs: A list of batches of inputs. If your model needs to be vmapped to handle batches, do that before calling quantize.
+    """
+
     with jax.disable_jit():
-        closed_jaxpr = jax.make_jaxpr(fn)(params, inputs[0])
+        jaxpr_args = (params, inputs[0])
+        if use_params_fp32:
+            jaxpr_args = jax.tree_util.tree_map(
+                lambda x: jax.ShapeDtypeStruct(x.shape, jnp.float32) if x.dtype.kind == 'f' else x,
+                jaxpr_args
+            )
+        closed_jaxpr = jax.make_jaxpr(fn)(*jaxpr_args)
     params = jax.device_put(params, jax.devices('cpu')[0])
     inputs = jax.device_put(inputs, jax.devices('cpu')[0])
 
@@ -44,7 +70,9 @@ def quantize(fn, params, inputs, block_size=128, actorder=False, damping=0.01, u
         block_size=block_size,
         actorder=actorder,
         damping=damping,
-        use_quantized_activations=use_quantized_activations
+        use_quantized_activations=use_quantized_activations,
+        use_fp64=use_fp64,
+        use_params_fp32=use_params_fp32
     )
     for ind, quantized_param in result.items():
         param_args[ind] = quantized_param
@@ -69,7 +97,18 @@ def _get_delete_points(jaxpr):
         delete_vars.append(eqn_delete)
     return delete_vars
 
-def _eval_and_quantize(jaxpr, consts, argnums, *args, block_size=128, actorder=False, damping=0.01, use_quantized_activations=True):
+def _eval_and_quantize(
+    jaxpr,
+    consts,
+    argnums,
+    *args,
+    block_size=128,
+    actorder=False,
+    damping=0.01,
+    use_quantized_activations=True,
+    use_fp64=False,
+    use_params_fp32=False
+):
     cpu = jax.devices('cpu')[0]
     gpu = jax.devices('gpu')[0]
     # Args are all either params or lists of tensors
@@ -121,6 +160,10 @@ def _eval_and_quantize(jaxpr, consts, argnums, *args, block_size=128, actorder=F
             name: jax.device_put(param_env[name][0], gpu)
             for name in needed_names if name in param_env
         }
+        if use_params_fp32:
+            for k, v in block_param_env.items():
+                if v.dtype.kind == 'f':
+                    block_param_env[k] = v.astype(jnp.float32)
 
         print(f'Current env size: {tree_size_bytes(envs):.2e} bytes')
         print(f'Current param env size: {tree_size_bytes(block_param_env):.2e} bytes')
@@ -169,7 +212,14 @@ def _eval_and_quantize(jaxpr, consts, argnums, *args, block_size=128, actorder=F
 
         w, xs = next(handler_coro)
 
-        quantized_w, quantize_params = gptq(w, xs, block_size=block_size, actorder=actorder, damping=damping)
+        quantized_w, quantize_params = gptq(
+            W=w,
+            xs=xs,
+            block_size=block_size,
+            actorder=actorder,
+            damping=damping,
+            use_fp64=use_fp64
+        )
         assert quantized_w.shape == w.shape
 
         try:
@@ -183,10 +233,15 @@ def _eval_and_quantize(jaxpr, consts, argnums, *args, block_size=128, actorder=F
         delete_indices = [i for i, name in enumerate(matmul_eqn.invars) if name != quantize_argname]
 
         do_eval = jax.jit(partial(eval_eqn, matmul_eqn))
-        
+
+        matmul_w_arg = quantized_w if use_fp64 else param_env[quantize_argname][0]
+        if use_params_fp32:
+            matmul_w_arg = matmul_w_arg.astype(jnp.float32)
+        matmul_w_arg = jax.device_put(matmul_w_arg, gpu)
+
         for env in envs:
             gpu_args = [
-                (quantized_w if use_quantized_activations else param_env[argname][0])
+                matmul_w_arg
                 if argname == quantize_argname else
                 env[argname]
                 for argname in matmul_eqn.invars

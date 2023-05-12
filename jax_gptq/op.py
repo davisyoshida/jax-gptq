@@ -74,8 +74,8 @@ def qmatmul_fwd(x, quantized_matrix, transpose_b):
     return _quantized_matmul(x, quantized_matrix, transpose_b), quantized_matrix
 
 def qmatmul_bwd(transposed, quantized_matrix, y_bar):
-    unpacked = unpack_matrix(quantized_matrix)
-    return y_bar @ unpacked.T, None
-    #return _quantized_matmul(y_bar, quantized_matrix, transpose_b=not transposed), None
+    #unpacked = unpack_matrix(quantized_matrix)
+    #return y_bar @ unpacked.T, None
+    return _quantized_matmul(y_bar, quantized_matrix, transpose_b=not transposed), None
 
 _quantized_matmul.defvjp(qmatmul_fwd, qmatmul_bwd)
