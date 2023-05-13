@@ -97,6 +97,10 @@ def _get_delete_points(jaxpr):
         delete_vars.append(eqn_delete)
     return delete_vars
 
+def _maybe_delete(val):
+    if not val.is_deleted():
+        val.device_buffer.delete()
+
 def _eval_and_quantize(
     jaxpr,
     consts,
@@ -179,14 +183,14 @@ def _eval_and_quantize(
         for i, env in enumerate(envs):
             gpu_env = jax.device_put(env, gpu)
             new_env = block_fn(block_param_env, gpu_env, const_env)
-            envs[i] = jax.device_put(new_env, cpu)
-            def maybe_delete(val):
-                if not val.is_deleted():
-                    val.device_buffer.delete()
-            jax.tree_map(maybe_delete, (gpu_env, new_env))
+            envs[i] = new_env
+            #envs[i] = jax.device_put(new_env, cpu)
+            #jax.tree_map(_maybe_delete, (gpu_env, new_env))
+
 
         for param in block_param_env.values():
             param.device_buffer.delete()
+
         del block_param_env
 
         param_env = updated_param_env
@@ -261,12 +265,17 @@ def _eval_and_quantize(
             else:
                 env[outvars[0]] = results
 
-            for i in delete_indices:
-                gpu_args[i].device_buffer.delete()
+            for name in delete_points[next_pos]:
+                if name in env:
+                    _maybe_delete(env[name])
+                    del env[name]
+
+            #for i in delete_indices:
+            #    gpu_args[i].device_buffer.delete()
             #(jax.device_put(0., gpu) + 0).block_until_ready()
 
-        for name in delete_points[next_pos]:
-            delete(name)
+        #for name in delete_points[next_pos]:
+        #    delete(name)
 
         # TODO: Instead of catching duplicate quantizations here avoid doing the calculation in the first place
         orig_w, orig_name, inv_transforms = param_env[quantize_argname]
