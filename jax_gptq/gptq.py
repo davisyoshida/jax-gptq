@@ -50,43 +50,51 @@ def _calc_mean(xs, dtype):
     mean_of_means = jnp.mean(jnp.stack(means), axis=0)
     return mean_of_means
 
-@partial(jax.jit, donate_argnums=(0,), static_argnums=(3,))
-def _accumulate_H_step(H, feature_mean, batch, N):
+@partial(jax.jit, donate_argnums=(0,1,2))
+def _accumulate_H_step(H, running_mean, n_samples, batch):
     if len(batch.shape) > 2:
         batch = batch.reshape(-1, batch.shape[-1])
 
-    N = jnp.asarray(N, H.dtype)
+    batch_size = batch.shape[0]
+    new_n_samples = n_samples + batch_size
 
     batch = batch.astype(H.dtype)
 
-    shifted = (batch - feature_mean) / jnp.sqrt(N)
+    new_mean = running_mean + jnp.sum(batch - running_mean, axis=0) / new_n_samples
 
-    H += shifted.T @ shifted
+    x_val = batch - running_mean
+    y_val = batch - new_mean
 
-    return H
+    H += x_val.T @ y_val
+
+    return H, new_mean, new_n_samples
 
 def accumulate_H(xs, use_fp64=False):
     """
     The method here differs from the original GPT-Q implementation.
-    Instead of calculating the mean of XX^T directly, I instead subtract
-    the feature mean off of each batch, then calculate the variance.
-    The second moment can then be recovered by the outer product
-    of the mean vector with itself. I don't bother dividing
-    by the number of examples since the algorithm is invariant
-    to rescalings of H.
+    Instead of calculating the mean of XX^T directly, I instead calculate
+    the variance using a running approximation of the mean.
+    The second moment can then be recovered by adding the outer product
+    of the mean vector with itself. The factor of 2 from the original
+    paper doesn't matter since the algorithm is invariant to
+    scaling the Hessian.
     """
 
     dtype = jnp.float64 if use_fp64 else jnp.float32
-    feature_mean = _calc_mean(xs, dtype)
+    #feature_mean = _calc_mean(xs, dtype)
 
     dim = xs[0].shape[-1]
-    N = sum(x.shape[0] for x in xs)
+    #N = sum(x.shape[0] for x in xs)
     H = jnp.zeros((dim, dim), dtype=dtype)
+    n_samples = jnp.zeros((), dtype)
+
+    running_mean = jnp.zeros(dim, dtype=dtype)
 
     for batch in xs:
-        H = _accumulate_H_step(H, feature_mean, batch, N)
+        H, running_mean, n_samples = _accumulate_H_step(H, running_mean, n_samples, batch)
 
-    H += jnp.outer(feature_mean, feature_mean)
+    H /= n_samples
+    H += jnp.outer(running_mean, running_mean)
 
     return H
 
