@@ -283,7 +283,7 @@ def _eval_and_quantize(
         if write_arg not in quantized_results:
             packed_result = pack_matrix(quantized_w, quantize_params, contraction_axis)
             un_transformed = reduce(lambda x, f: f(x), inv_transforms, packed_result)
-            quantized_results[write_arg] = un_transformed
+            quantized_results[write_arg] = jax.device_put(un_transformed, cpu)
 
             if quantize_argname not in delete_points[next_pos]:
                 cpu_quantized_w = jax.device_put(quantized_w, cpu)
