@@ -21,10 +21,14 @@ class QuantizedMatrix:
     def dtype(self):
         return self.zero.dtype
 
-jax.tree_util.register_pytree_node(
+jax.tree_util.register_pytree_with_keys(
     QuantizedMatrix,
-    lambda x: ((x.int_weight, x.zero, x.scale), x.contraction_axis),
-    lambda contraction_axis, xs: QuantizedMatrix(*xs, contraction_axis)
+    lambda x: ([
+        ('int_weight', x.int_weight),
+        ('zero', x.zero),
+        ('scale', x.scale),
+    ], x.contraction_axis),
+    lambda contraction_axis, xs: QuantizedMatrix(*xs, contraction_axis=contraction_axis),
 )
 
 def quant_matrix_shape(quantized_matrix, bits=4):

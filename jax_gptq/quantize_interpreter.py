@@ -238,9 +238,10 @@ def _eval_and_quantize(
 
         do_eval = jax.jit(partial(eval_eqn, matmul_eqn))
 
-        matmul_w_arg = quantized_w if use_fp64 else param_env[quantize_argname][0]
+        matmul_w_arg = quantized_w if use_quantized_activations else param_env[quantize_argname][0]
         if use_params_fp32:
             matmul_w_arg = matmul_w_arg.astype(jnp.float32)
+
         matmul_w_arg = jax.device_put(matmul_w_arg, gpu)
 
         for env in envs:
