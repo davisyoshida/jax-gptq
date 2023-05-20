@@ -31,7 +31,7 @@ def partial_static_args(f, static_argnums, *args):
         return f(*args, **kwargs)
     return inner
 
-def use_quantized(f, static_argnums=(), use_kernel=False):
+def use_quantized(f, static_argnums=(), use_kernel=False, remat_unpack=False):
     if isinstance(static_argnums, int):
         static_argnums = (static_argnums,)
     @wraps(f)
@@ -51,13 +51,14 @@ def use_quantized(f, static_argnums=(), use_kernel=False):
             closed_jaxpr.jaxpr,
             closed_jaxpr.literals,
             *flat_args,
-            use_kernel=use_kernel
+            use_kernel=use_kernel,
+            remat_unpack=remat_unpack
         )
         return jax.tree_util.tree_unflatten(output_struct, result)
 
     return inner
 
-def eval_jaxpr_with_quantized_args(jaxpr, consts, *args, use_kernel=False):
+def eval_jaxpr_with_quantized_args(jaxpr, consts, *args, use_kernel=False, remat_unpack=False):
     def read(v):
       return v.val if isinstance(v, Literal) else env[v]
 
@@ -73,7 +74,10 @@ def eval_jaxpr_with_quantized_args(jaxpr, consts, *args, use_kernel=False):
         if any(isinstance(arg, QuantizedMatrix) for arg in args):
             ans = eval_with_quantized(eqn, args, use_kernel=use_kernel)
             if ans is None:
-                args = [unpack_matrix(arg) if isinstance(arg, QuantizedMatrix) else arg for arg in args]
+                unpack_fn =unpack_matrix
+                if remat_unpack:
+                    unpack_fn = jax.checkpoint(unpack_fn)
+                args = [unpack_fn(arg) if isinstance(arg, QuantizedMatrix) else arg for arg in args]
 
         subfuns, bind_params = eqn.primitive.get_bind_params(eqn.params)
         if ans is None:
